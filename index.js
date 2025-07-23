@@ -17,6 +17,10 @@ const questionsRoutes = require('./questions');
 const answersRoutes = require('./answers');
 const roundsRoutes = require('./rounds');
 
+const debugRoutes = require('./debug');
+app.use('/debug', debugRoutes);
+
+
 // Register Routes (only once each!)
 app.use('/auth', authRoutes);
 app.use('/games', gamesRoutes);

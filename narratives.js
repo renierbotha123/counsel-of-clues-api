@@ -1,54 +1,80 @@
-// answers.js
 const express = require('express');
 const router = express.Router();
 const pool = require('./db');
-const axios = require('axios');
+const fetch = require('node-fetch');
 
-// Submit an answer
-router.post('/:gameId/:playerId/:round', async (req, res) => {
-  const { gameId, playerId, round } = req.params;
-  const { question, answer, type, selected_option } = req.body;
+// POST /narratives/generate/:gameId/round/:round
+router.post('/generate/:gameId/round/:round', async (req, res) => {
+  const { gameId, round } = req.params;
 
   try {
-    // Save or update the answer
-    await pool.query(
-      `INSERT INTO answers (game_id, player_id, round, question, answer, type, selected_option)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (game_id, player_id, round) DO UPDATE
-       SET question=EXCLUDED.question,
-           answer=EXCLUDED.answer,
-           type=EXCLUDED.type,
-           selected_option=EXCLUDED.selected_option`,
-      [gameId, playerId, round, question, answer || null, type || 'text', selected_option || null]
-    );
+    console.log(`🧠 [Narrative Generator] Triggered for game ${gameId}, round ${round}`);
 
-    // Check if all players have answered
-    const totalPlayersRes = await pool.query(
-      'SELECT COUNT(*) FROM game_players WHERE game_id=$1',
-      [gameId]
-    );
-    const totalPlayers = Number(totalPlayersRes.rows[0].count);
-
-    const answeredRes = await pool.query(
-      'SELECT COUNT(DISTINCT player_id) FROM answers WHERE game_id=$1 AND round=$2',
+    // Fetch all answers for this round
+    const answersRes = await pool.query(
+      'SELECT * FROM answers WHERE game_id = $1 AND round = $2',
       [gameId, round]
     );
-    const answered = Number(answeredRes.rows[0].count);
+    const answerData = answersRes.rows;
 
-    console.log(`🟡 Waiting: ${answered}/${totalPlayers} players answered`);
-
-    if (answered < totalPlayers) {
-      return res.json({ status: 'waiting', answered, totalPlayers });
+    if (answerData.length === 0) {
+      return res.status(400).json({ error: 'No answers found for this round.' });
     }
 
-    console.log('✅ All players answered. Generating narrative...');
-    // Trigger narrative generation
-    await axios.post(`http://localhost:3000/narratives/generate/${gameId}/round/${round}`);
+    let fullNarrative = '';
+    let clueMap = {};
 
-    return res.json({ status: 'complete', answered, totalPlayers });
+    // Call the AI
+    const aiRes = await fetch('http://192.168.0.240:11434/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: "mistral",
+        prompt: `You are an AI mystery narrator. Create a short dramatic narrative summarizing the murder mystery round. At the end, provide clues in this exact format:\n\n{\n  "narrative": "the full story...",\n  "clues": [\n    { "player_id": 135, "clue": "..." },\n    { "player_id": 136, "clue": "..." }\n  ]\n}\n\nUse the answers:\n${JSON.stringify(answerData)}`
+      })
+    });
+
+    const lines = (await aiRes.text()).split('\n').filter(Boolean);
+    console.log('🧠 Raw AI response lines:', lines);
+
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.narrative && parsed.clues) {
+          console.log('✅ Parsed AI Narrative:', parsed.narrative);
+          console.log('🕵️‍♂️ Parsed Clues:', parsed.clues);
+          fullNarrative = parsed.narrative;
+          for (const clueObj of parsed.clues) {
+            clueMap[clueObj.player_id] = clueObj.clue;
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ JSON parse failed:', line);
+      }
+    }
+
+    // Save narrative
+    await pool.query(
+      'INSERT INTO narratives (game_id, round, narrative, clue) VALUES ($1, $2, $3, $4)',
+      [gameId, round, fullNarrative, 'summary']
+    );
+    console.log('💾 Saved narrative to DB.');
+
+    // Save each clue to corresponding answer row
+    for (const row of answerData) {
+      const clue = clueMap[row.player_id] || '';
+     await pool.query(`
+  UPDATE answers SET clue = $1, narrative = $2
+  WHERE game_id = $3 AND round = $4 AND player_id = $5
+`, [clueText, narrativeText, gameId, round, playerId]);
+      console.log(`🧩 Clue saved for player ${row.player_id}: ${clue}`);
+    }
+
+    return res.json({ status: 'narrative_saved', narrative: fullNarrative });
+
   } catch (err) {
-    console.error('❌ Error saving answer:', err);
-    res.status(500).json({ error: err.message });
+    console.error('❌ Narrative generation error:', err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
